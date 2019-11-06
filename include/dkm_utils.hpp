@@ -1,14 +1,30 @@
 #pragma once
 
+#include "dkm.hpp"
+
 #include <algorithm>
 #include <array>
 #include <tuple>
 #include <vector>
-
-#include "dkm.hpp"
+#include <fstream>
+#include <iterator>
+#include <regex>
 
 namespace dkm {
 
+namespace details {
+	
+// Split a line on commas, making it simple to pull out the values we need
+std::vector<std::string> split_commas(const std::string& line) {
+	std::vector<std::string> split;
+	std::regex reg(",");
+	std::copy(std::sregex_token_iterator(line.begin(), line.end(), reg, -1),
+		std::sregex_token_iterator(),
+		std::back_inserter(split));
+	return split;
+}
+
+}
 
 /**
  * Calculates the Euclidean distance from each point in the given sequence
@@ -53,7 +69,17 @@ T sum_dist(const std::vector<std::array<T, N>>& points, const std::array<T, N>& 
  * @param label  Label of the cluster to be obtained.
  *
  * @return Sequence of points that all belong to the cluster with the given label.
- */
+ */// Split a line on commas, making it simple to pull out the values we need
+std::vector<std::string> split_commas(const std::string& line) {
+	std::vector<std::string> split;
+	std::regex reg(",");
+	std::copy(std::sregex_token_iterator(line.begin(), line.end(), reg, -1),
+		std::sregex_token_iterator(),
+		std::back_inserter(split));
+	return split;
+}
+
+
 template <typename T, size_t N>
 std::vector<std::array<T, N>> get_cluster(
 	const std::vector<std::array<T, N>>& points, const std::vector<uint32_t>& labels, const uint32_t label) {
@@ -122,6 +148,47 @@ std::tuple<std::vector<std::array<T, N>>, std::vector<uint32_t>> get_best_means(
 	}
 	// copy and return
 	return best_means;
+}
+
+/**
+ * Return the index of the cluster that has the closest centroid to the query
+ * @param centroids List of cluster centroids
+ * @param query Query to which the closest centroids is found
+ * @return Index of closest centroid (class)
+ */
+template <typename T, size_t N>
+size_t predict(const std::vector<std::array<T, N>>& centroids, const std::array<T, N>& query) {
+	T min = details::distance(centroids[0], query);
+	size_t index = 0;
+	for(size_t i = 1; i < centroids.size(); i++) {
+		auto dist = details::distance(centroids[i], query);
+		if (dist < min) {
+			min = dist;
+			index = i;
+		}
+	}
+	return index;
+}
+
+/**
+ * Load a dataset from a CSV file where each row is a point with N values.
+ * @param path Location of file on disk to load data from.
+ * @return A k-means ready data set (a std::vector of std::array rows)
+ */
+template <typename T, size_t N>
+std::vector<std::array<T, N>> load_csv(const std::string& path) {
+	std::ifstream file(path);
+	std::vector<std::array<T, N>> data;
+	for (auto it = std::istream_iterator<std::string>(file); it != std::istream_iterator<std::string>(); ++it) {
+		auto split = details::split_commas(*it);
+		assert(split.size() == N); // number of values must match rows in file
+		std::array<T, N> row;
+		std::transform(split.begin(), split.end(), row.begin(), [](const std::string& in) -> T {
+			return static_cast<T>(std::stod(in));
+		});
+		data.push_back(row);
+	}
+	return data;
 }
 
 } // namespace dkm

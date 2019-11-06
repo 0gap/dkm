@@ -68,16 +68,14 @@ This is an alternate initialization method based on the [kmeans++](https://en.wi
 initialization algorithm.
 */
 template <typename T, size_t N>
-std::vector<std::array<T, N>> random_plusplus(const std::vector<std::array<T, N>>& data, uint32_t k) {
+std::vector<std::array<T, N>> random_plusplus(const std::vector<std::array<T, N>>& data, uint32_t k, uint64_t seed) {
 	assert(k > 0);
 	assert(data.size() > 0);
 	using input_size_t = typename std::array<T, N>::size_type;
 	std::vector<std::array<T, N>> means;
 	// Using a very simple PRBS generator, parameters selected according to
 	// https://en.wikipedia.org/wiki/Linear_congruential_generator#Parameters_in_common_use
-	std::random_device rand_device;
-	std::linear_congruential_engine<uint64_t, 6364136223846793005, 1442695040888963407, UINT64_MAX> rand_engine(
-		rand_device());
+	std::linear_congruential_engine<uint64_t, 6364136223846793005, 1442695040888963407, UINT64_MAX> rand_engine(seed);
 
 	// Select first mean at random from the set
 	{
@@ -162,8 +160,90 @@ std::vector<std::array<T, N>> calculate_means(const std::vector<std::array<T, N>
 	return means;
 }
 
+template <typename T, size_t N>
+std::vector<T> deltas(
+	const std::vector<std::array<T, N>>& old_means, const std::vector<std::array<T, N>>& means)
+{
+	std::vector<T> distances;
+	distances.reserve(means.size());
+	assert(old_means.size() == means.size());
+	for (size_t i = 0; i < means.size(); ++i) {
+		distances.push_back(distance(means[i], old_means[i]));
+	}
+	return distances;
+}
+
+template <typename T>
+bool deltas_below_limit(const std::vector<T>& deltas, T min_delta) {
+	for (T d : deltas) {
+		if (d > min_delta) {
+			return false;
+		}
+	}
+	return true;
+}
+
 } // namespace details
 
+/*
+clustering_parameters is the configuration used for running the kmeans_lloyd algorithm.
+
+It requires a k value for initialization, and can subsequently be configured with your choice
+of optional parameters, including:
+* Maximum iteration count; the algorithm will terminate if it reaches this iteration count
+  before converging on a solution. The results returned are the means and cluster assignments 
+  calculated in the last iteration before termination.
+* Minimum delta; the algorithm will terminate if the change in position of all means is
+  smaller than the specified distance.
+* Random seed; if present, this will be used in place of `std::random_device` for kmeans++
+  initialization. This can be used to ensure reproducible/deterministic behavior.
+*/
+template <typename T>
+class clustering_parameters {
+public:
+	explicit clustering_parameters(uint32_t k) :
+	_k(k),
+	_has_max_iter(false), _max_iter(),
+	_has_min_delta(false), _min_delta(),
+	_has_rand_seed(false), _rand_seed()
+	{}
+
+	void set_max_iteration(uint64_t max_iter)
+	{
+		_max_iter = max_iter;
+		_has_max_iter = true;
+	}
+
+	void set_min_delta(T min_delta)
+	{
+		_min_delta = min_delta;
+		_has_min_delta = true;
+	}
+
+	void set_random_seed(uint64_t rand_seed)
+	{
+		_rand_seed = rand_seed;
+		_has_rand_seed = true;
+	}
+
+	bool has_max_iteration() const { return _has_max_iter; }
+	bool has_min_delta() const { return _has_min_delta; }
+	bool has_random_seed() const { return _has_rand_seed; }
+
+	uint32_t get_k() const { return _k; };
+	uint64_t get_max_iteration() const { return _max_iter; }
+	T get_min_delta() const { return _min_delta; }
+	uint64_t get_random_seed() const { return _rand_seed; }
+
+private:
+	uint32_t _k;
+	bool _has_max_iter;
+	uint64_t _max_iter;
+	bool _has_min_delta;
+	T _min_delta;
+	bool _has_rand_seed;
+	uint64_t _rand_seed;
+};
 
 /*
 Implementation of k-means generic across the data type and the dimension of each data item. Expects
@@ -171,6 +251,10 @@ the data to be a vector of fixed-size arrays. Generic parameters are the type of
 and the dimensionality of each data point (N). All points must have the same dimensionality.
 
 e.g. points of the form (X, Y, Z) would be N = 3.
+
+Takes a `clustering_parameters` struct for algorithm configuration. See the comments for the
+`clustering_parameters` struct for more information about the configuration values and how they
+affect the algorithm.
 
 Returns a std::tuple containing:
   0: A vector holding the means for each cluster from 0 to k-1.
@@ -181,30 +265,54 @@ Implementation details:
 This implementation of k-means uses [Lloyd's Algorithm](https://en.wikipedia.org/wiki/Lloyd%27s_algorithm)
 with the [kmeans++](https://en.wikipedia.org/wiki/K-means%2B%2B)
 used for initializing the means.
+
 */
 template <typename T, size_t N>
 std::tuple<std::vector<std::array<T, N>>, std::vector<uint32_t>> kmeans_lloyd(
-	const std::vector<std::array<T, N>>& data, uint32_t k) {
+	const std::vector<std::array<T, N>>& data, const clustering_parameters<T>& parameters) {
 	static_assert(std::is_arithmetic<T>::value && std::is_signed<T>::value,
 		"kmeans_lloyd requires the template parameter T to be a signed arithmetic type (e.g. float, double, int)");
-	assert(k > 0); // k must be greater than zero
-	assert(data.size() >= k); // there must be at least k data points
-	std::vector<std::array<T, N>> means = details::random_plusplus(data, k);
+	assert(parameters.get_k() > 0); // k must be greater than zero
+	assert(data.size() >= parameters.get_k()); // there must be at least k data points
+	std::random_device rand_device;
+	uint64_t seed = parameters.has_random_seed() ? parameters.get_random_seed() : rand_device();
+	std::vector<std::array<T, N>> means = details::random_plusplus(data, parameters.get_k(), seed);
 
 	std::vector<std::array<T, N>> old_means;
 	std::vector<std::array<T, N>> old_old_means;
 	std::vector<uint32_t> clusters;
-	// Calculate new means until convergence is reached
-	int count = 0;
+	// Calculate new means until convergence is reached or we hit the maximum iteration count
+	uint64_t count = 0;
 	do {
 		clusters = details::calculate_clusters(data, means);
 		old_old_means = old_means;
 		old_means = means;
-		means = details::calculate_means(data, clusters, old_means, k);
+		means = details::calculate_means(data, clusters, old_means, parameters.get_k());
 		++count;
-	} while (means != old_means && means != old_old_means);
+	} while (means != old_means && means != old_old_means
+		&& !(parameters.has_max_iteration() && count == parameters.get_max_iteration())
+		&& !(parameters.has_min_delta() && details::deltas_below_limit(details::deltas(old_means, means), parameters.get_min_delta())));
 
 	return std::tuple<std::vector<std::array<T, N>>, std::vector<uint32_t>>(means, clusters);
+}
+
+/*
+This overload exists to support legacy code which uses this signature of the kmeans_lloyd function.
+Any code still using this signature should move to the version of this function that uses a
+`clustering_parameters` struct for configuration.
+*/
+template <typename T, size_t N>
+std::tuple<std::vector<std::array<T, N>>, std::vector<uint32_t>> kmeans_lloyd(
+	const std::vector<std::array<T, N>>& data, uint32_t k,
+	uint64_t max_iter = 0, T min_delta = -1.0) {
+	clustering_parameters<T> parameters(k);
+	if (max_iter != 0) {
+		parameters.set_max_iteration(max_iter);
+	}
+	if (min_delta != 0) {
+		parameters.set_min_delta(min_delta);
+	}
+	return kmeans_lloyd(data, parameters);
 }
 
 } // namespace dkm
